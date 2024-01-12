@@ -1,9 +1,113 @@
 # MIT6.5840
 2023Spring课程链接https://pdos.csail.mit.edu/6.824/schedule.html
+# LAB1: MapReduce
+MapReduce是一种编程模型，用于处理和生成大数据集。它最初由Google开发，后来成为处理大规模数据集的流行方法，尤其是在分布式计算环境中。MapReduce模型主要包括两个步骤：Map阶段和Reduce阶段。
 
-Raft官网的可交互性动画对于理解论文中的细节非常有帮助https://raft.github.io
+Map阶段：在这个阶段，输入数据集被分成独立的小块，这些小块并行地由多个Map任务处理。每个Map任务处理一小块数据，并生成一组中间键值对（key-value pairs）作为输出。
+
+Reduce阶段：接着，在Reduce阶段，对Map阶段输出的所有中间键值对进行处理。具有相同键的值被分组在一起，并传递给Reduce任务。每个Reduce任务接收某个键及其对应的值集合，然后合并这些值以形成一组较小的值集合。最终，Reduce阶段的输出可以是数据的一个新的、更小的集合，或是对数据的总结和分析结果。
+
+本实验采用了最经典的word count任务：统计许多文件中的每个单词出现的次数。
+
+在分布式系统中文件数量非常庞大，我们需要切分这些文件，在HDFS(Hadoop Distributed File system)中每个split通常是128MB，而GFS(Google File System)每个split通常是64MB。每个Map worker可以接收多个文件splits，然后将统计结果写入到本地磁盘中。在Map任务完成过后，Reduce workers读取这些中间文件，对结果进行汇总。由于执行Map任务和Reduce任务通常是不同的机器，这需要使用Network进行传输，通常为了减小Network I/O，每个Map worker可以选择对本地结果进行局部汇总后再传输给远程的Reduce worker. MapRduce执行过程如图(adopted from Bryan Hooi, NUS)：
+![Example Image](images/MapReduce.png)
+
+首先我们可以先从课程官网提供的sequential版本的MapReduce入手，了解MapReduce的执行过程:
+首先我们需要简单的Map函数和Reduce函数：
+```go
+func Map(filename string, contents string) []mr.KeyValue {
+	// function to detect word separators.
+	ff := func(r rune) bool { return !unicode.IsLetter(r) }
+
+	// split contents into an array of words.
+	words := strings.FieldsFunc(contents, ff)
+
+	kva := []mr.KeyValue{}
+	for _, w := range words {
+		kv := mr.KeyValue{Key: w, Value: "1"}
+		kva = append(kva, kv)
+	}
+	return kva
+}
+
+func Reduce(key string, values []string) string {
+	// return the number of occurrences of this word.
+	return strconv.Itoa(len(values))
+}
+```
+不难看出，Map函数这里将整个文件中的英文单词转换为了key-value pairs，比如: 
+```
+["hello": "1", "Mike": "1", "hello": "1", "Jerry": "1"]
+```
+如果这三个keys都映射到同一个Reduce worker中，那么排序整合后（之后会说明具体实现）的结果为:
+```
+["hello": ["1", "1"], "Mike": ["1"], "Jerry": ["1"]]
+```
+调用该Reduce函数便分别返回2、1、1。
+
+这两个函数会提前将其编译，然后再运行时作为插件(plugin)动态加载到程序中:
+```go
+mapf, reducef := loadPlugin(os.Args[1])
+```
+
+sequential这里意味着不采用分布式计算，一个机器完成所有的Map任务和Reduce任务。
+我们已经知道Map任务是将英文单词转换为key-value pairs，然后将其写入中间文件（临时文件）中：
+```go
+intermediate := []mr.KeyValue{}
+for _, filename := range os.Args[2:] {
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", filename)
+	}
+	content, err := io.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", filename)
+	}
+	file.Close()
+	kva := mapf(filename, string(content))
+	intermediate = append(intermediate, kva...)
+}
+```
+这里其实并没有创建真正的中间文件，只是写入到Array中，供后面的Reduce任务汇总。后面我们采用的分布式计算，需要将不同的keys映射到不同的Reduce workers中，即写入到不同的中间文件中。
+
+我们对所有keys进行排序:
+```go
+sort.Sort(ByKey(intermediate))
+```
+这样同一个key就会聚集在一起，方便我们使用Reduce函数：
+```go
+oname := "mr-out-0"
+ofile, _ := os.Create(oname)
+
+//
+// call Reduce on each distinct key in intermediate[],
+// and print the result to mr-out-0.
+//
+i := 0
+for i < len(intermediate) {
+	j := i + 1
+	for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+		j++
+	}
+	values := []string{}
+	for k := i; k < j; k++ {
+		values = append(values, intermediate[k].Value)
+	}
+	output := reducef(intermediate[i].Key, values)
+
+	// this is the correct format for each line of Reduce output.
+	fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+	i = j
+}
+
+ofile.Close()
+```
+这样所有的keys和其对应的数量都会写入到"mr-out-0"文件中。完成了单个机器上的MapReduce任务。该部分具体代码文件在src/main/mrsequential.go中。
+当然你会发现这里的默认Map函数并不高效，你可以选择使用in-mapper combiner策略，即汇总局部的结果，例如"hello" 统计为"2"再传给Reduce worker，当然也需要稍微修改一下Reduce函数。
 
 # LAB2: Raft
+Raft官网的可交互性动画对于理解论文中的细节非常有帮助https://raft.github.io
 Raft是分布式系统中理解起来相对容易的一致性算法/协议。一致性对于fault-tolerant systems非常重要，Raft通过几个重要的特性来实现一致性（论文Figure 3）：
 *  __Election Safety__: at most one leader can be elected in a given term.
 *  __Leader Append-Only__: a leader never overwrites or deletes entries in its log; it only appends new entries.
