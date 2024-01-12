@@ -12,7 +12,9 @@ Reduce阶段：接着，在Reduce阶段，对Map阶段输出的所有中间键�
 在分布式系统中文件数量非常庞大，我们需要切分这些文件，在HDFS(Hadoop Distributed File system)中每个split通常是128MB，而GFS(Google File System)每个split通常是64MB。每个Map worker可以接收多个文件splits，然后将统计结果写入到本地磁盘中。在Map任务完成过后，Reduce workers读取这些中间文件，对结果进行汇总。由于执行Map任务和Reduce任务通常是不同的机器，这需要使用Network进行传输，通常为了减小Network I/O，每个Map worker可以选择对本地结果进行局部汇总后再传输给远程的Reduce worker. MapRduce执行过程如图(adopted from Bryan Hooi, NUS)：
 ![Example Image](images/MapReduce.png)
 
-首先我们可以先从课程官网提供的sequential版本的MapReduce入手，了解MapReduce的执行过程:
+# Sequential MapReduce
+首先我们可以先从课程官网提供的Sequential版本的MapReduce入手，了解MapReduce的执行过程。Sequential这里意味着不采用分布式计算，一个机器完成所有的Map任务和Reduce任务。
+
 首先我们需要简单的Map函数和Reduce函数：
 ```go
 func Map(filename string, contents string) []mr.KeyValue {
@@ -50,7 +52,6 @@ func Reduce(key string, values []string) string {
 mapf, reducef := loadPlugin(os.Args[1])
 ```
 
-sequential这里意味着不采用分布式计算，一个机器完成所有的Map任务和Reduce任务。
 我们已经知道Map任务是将英文单词转换为key-value pairs，然后将其写入中间文件（临时文件）中：
 ```go
 intermediate := []mr.KeyValue{}
@@ -106,6 +107,398 @@ ofile.Close()
 这样所有的keys和其对应的数量都会写入到"mr-out-0"文件中。完成了单个机器上的MapReduce任务。该部分具体代码文件在src/main/mrsequential.go中。
 当然你会发现这里的默认Map函数并不高效，你可以选择使用in-mapper combiner策略，即汇总局部的结果，例如"hello" 统计为"2"再传给Reduce worker，当然也需要稍微修改一下Reduce函数。
 
+# Distributed MapReduce
+分布式MapReduce要求我们实现一个Coordinator(Master)来协调管理整个流程，当中有十分多的Map worker和Ruduce worker，他们共同合作来完成word count的任务。
+
+一个Coordinator(Master)的作用是将任务分配给每个worker，如果某个任务在规定时间内没有被完成，那么它就需要重新将任务发送给worker去执行。首先，我们可以看到在src/main/mrcoordinator.go中创建了一个coordinator进程，并通过coordinator自身的Done方法来检查任务是否完成，每睡眠一秒检查一次以防止忙等待(busy-waiting)。若任务完成便退出。
+```go
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprintf(os.Stderr, "Usage: mrcoordinator inputfiles...\n")
+		os.Exit(1)
+	}
+
+	m := mr.MakeCoordinator(os.Args[1:], 10)
+	for m.Done() == false {
+		time.Sleep(time.Second)
+	}
+
+	time.Sleep(time.Second)
+}
+```
+如果我们假设Coordinator自身的状态为FINISHIED便退出，那么Done方法的定义可以如下：
+```go
+var ret bool
+func (c *Coordinator) Done() bool {
+	// Your code here.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ret = c.state == FINISHIED
+	return ret
+}
+```
+接下来我们需要考虑身为一个Coordinator，我们需要给这个struct提供什么属性和方法呢？
+
+```go
+type Coordinator struct {
+	// Your definitions here.
+	state         string
+	nReduce       int
+	nMap          int
+	taskQue       chan *Task
+	finishedTasks int
+	onGoingTask   map[int]*Task
+	mu            sync.Mutex
+}
+```
+这里我们分别记录了系统当前的状态、多少个reduce workers（模拟）、多少个map workers（模拟）、维护了一个等待任务队列（一个带有容量的channel）、已完成任务的数量、正在处理的任务队列（一个Hashmap）、和Coordinator专属的一把锁。
+
+Coordinator会将文件块分配给不同的workers，本LAB要求将其简化为每个worker分配一整个文件。那么整体流程如下:
+* Coordinator初始化为MAP状态，将任务送入等待任务队列。
+* 另一端的Worker进程通过RPC间歇性地请求任务。
+* Coordinator收到RPC后将任务队列的队首(任务)通过RPC传递过去，并将其记录在正在处理的任务队列中。
+* Map worker完成任务后会再次调用RPC告知Coordinator我的任务已经完成。
+* Coordinator收到RPC后，将其移出正在处理的任务队列，并增加已完成任务的数量。
+* Coordinator会定时检查位于正在处理的任务队列中的任务是否超时，如果超时，会将其重新送入等待队列，并将其移出正在处理队列。
+* 当worker请求任务并且Coordinator的等待队列没有任务的时候，Coordinator会发送一个"WAITTING"任务让其等待。
+* Coordinator发现MAP任务数量达标后，会修改当前状态进入Reduce状态，完成上述类似操作。
+* Coordinator发现REDUCE任务数量达标后，会修改当前状态进入Reduce状态，worker请求任务时会获得"QUIT"任务，直接退出。
+* Coordinator最后实现状态从QUIT到FINISHED的转变，退出Coordinator进程。
+
+如果只启动了一个worker进程，那么相当于是一个worker完成所有的Map任务和Reduce任务。
+
+假如我们启动了两个worker进程，在MAP阶段，两个worker充当了不同的Mapper，通过RPC向Coordinator请求任务。当某个进程获得一个任务后，会完成Map task，将该文件拆分成key-value pairs，并将输出写入到nReduce个文件里。另一个worker进程也是一样。当所有的Map tasks分配完成后，如果某一个worker再次请求任务，会收到等待任务，进行等待。当Coordinator收到所有的Map tasks完成的消息后，便进入Reduce状态，此时这两个worker进程便充当了Reducer的身份，进行Reduce任务。
+
+所以本实验中nReduce变量只是相当于模拟多个Reducers，本实验nReduce == 每个map任务写入中间文件的数量 == 最终输出文件数量。同样，nMap == Map tasks的数量 == 文件的数量。而真正需要达到nReduce的计算量，那么我们至少需要启动n个worker进程来完成Reduce任务。由于本例文件很小而且文件数量极少，多个worker进程的效果并不明显。
+
+明白了大体流程后，我们就可以动手实现了，首先是初始化Coordinator操作：
+```go
+func MakeCoordinator(files []string, nReduce int) *Coordinator {
+	c := Coordinator{}
+	
+	// Your code here.
+	c.nReduce = nReduce
+	c.nMap = len(files)
+	c.taskQue = make(chan *Task, max(len(files), nReduce))
+	c.mu = sync.Mutex{}
+	c.state = MAP
+	c.onGoingTask = make(map[int]*Task)
+	c.finishedTasks = 0
+	
+	for i, filename := range files {
+		// Create a map task.
+		task := Task{
+			ID:       i,
+			Type:     MAP,
+			FileName: filename,
+			NReduce:  c.nReduce,
+			NMap:     c.nMap,
+			Deadline: -1,
+		}
+		c.taskQue <- &task
+	}
+	
+	go c.detector()
+	go c.server()
+	return &c
+}
+```
+其中涉及开启一个go程检查任务是否完成或者任务是否超时：
+```go
+func (c *Coordinator) detector() {
+	for {
+		c.mu.Lock()
+		if c.state == MAP && c.finishedTasks == c.nMap ||
+			c.state == REDUCE && c.finishedTasks == c.nReduce ||
+			c.state == QUIT && c.finishedTasks == c.nReduce {
+			c.changeState()
+		} else {
+			c.taskTimeout()
+		}
+		c.mu.Unlock()
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+```
+还涉及开启一个go程启动服务器监听RPC调用。本实验为了简化流程创立了本地socket来进行进程间通信，实际应用中涉及到网络传输需要建立tcp连接使用端口号。
+```go
+func (c *Coordinator) server() {
+	rpc.Register(c)
+	rpc.HandleHTTP()
+	//l, e := net.Listen("tcp", ":1234")
+	sockname := coordinatorSock()
+	os.Remove(sockname)
+	l, e := net.Listen("unix", sockname)
+	if e != nil {
+		log.Fatal("listen error:", e)
+	}
+	go http.Serve(l, nil)
+}
+```
+如果detector发现任务完成需要切换状态，对于MAP --> REDUCE，我们需要具体说明task并将其添加到等待队列中，而对于REDUCE --> QUIT以及后续的切换，我们只需要在对方请求任务时发送简单的标识性任务或者直接终止即可。
+```go
+func (c *Coordinator) changeState() {
+	if c.state == MAP {
+		// Shift current state to Reduce
+		c.state = REDUCE
+		for i := 0; i < c.nReduce; i++ {
+			// Create a reduce task.
+			task := Task{
+				ID:       i,
+				Type:     REDUCE,
+				NReduce:  c.nReduce,
+				NMap:     c.nMap,
+				Deadline: -1,
+			}
+			c.taskQue <- &task
+			c.finishedTasks = 0
+		}
+	} else if c.state == REDUCE {
+		DPrintln("QUIT!!!!")
+		c.state = QUIT
+	} else {
+		DPrintln("FINISHED!!!!")
+		c.state = FINISHIED
+		os.Exit(0)
+	}
+}
+```
+对于超时任务的处理，我们先从正在处理队列中找到超时任务，将其重新加入等待处理队列，最后从运行队列中删除：
+```go
+func (c *Coordinator) taskTimeout() {
+	// Check if there are any timeouts in the currently running tasks,
+	// remove them from c.onGongingTask, and then re-add them to c.taskQue.
+	tasksToDelete := []int{}
+	for taskID, task := range c.onGoingTask {
+		if time.Now().Unix() > task.Deadline {
+			task.Deadline = -1
+			c.taskQue <- task
+			tasksToDelete = append(tasksToDelete, taskID)
+		}
+	}
+
+	for _, key := range tasksToDelete {
+		delete(c.onGoingTask, key)
+	}
+}
+```
+当worker请求任务时，如果等待队列不为空，我们将设定该任务超时时间，然后通过RPC传递该任务，并将该任务从等待队列中移动到正在处理队列；
+如果等待队列中没有任务并且又不处于退出状态，向worker回复一个等待任务；
+如果等待队列中没有任务且处于退出状态，向worker回复一个退出任务。
+```go
+func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) error {
+	c.mu.Lock()
+	if len(c.taskQue) != 0 {
+		task := <-c.taskQue
+		task.Deadline = time.Now().Add(TIME_OUT).Unix()
+		reply.Task = task
+		c.onGoingTask[task.ID] = task
+	} else if len(c.taskQue) == 0 && c.state != QUIT {
+		reply.Task = &Task{Type: WAITING}
+	} else {
+		reply.Task = &Task{Type: QUIT}
+	}
+	c.mu.Unlock()
+	return nil
+}
+```
+worker通过RPC调用Coordinator的Done方法来告知Coordinator任务已完成：
+```go
+func (c *Coordinator) TaskDone(args *TaskDoneArgs, reply *TaskDoneReply) error {
+	c.mu.Lock()
+	delete(c.onGoingTask, args.ID)
+	c.finishedTasks++
+	c.mu.Unlock()
+	return nil
+}
+```
+Coordinator的属性和方法大致如上述，具体实现在src/mr/coordinator.go中。
+接下来我们来看worker的实现：
+
+最基本的我们需要具备请求任务功能并且可以通知Coordinator任务完成：
+```go
+func RequestTask() *Task {
+	args := RequestTaskArgs{}
+	reply := RequestTaskReply{}
+
+	if ok := call("Coordinator.RequestTask", &args, &reply); !ok {
+		log.Println("RequestTask call failed!")
+	}
+	return reply.Task
+}
+
+func sendTaskDone(taskId int, taskType string) {
+	args := TaskDoneArgs{taskId, taskType}
+	reply := TaskDoneReply{}
+
+	if ok := call("Coordinator.TaskDone", &args, &reply); !ok {
+		log.Println("sendTaskDone failed!")
+	}
+}
+```
+接下来我们需要初始化一个worker进程(mrworker.go会调用这个函数来创建worker进程)：
+```go
+func Worker(mapf func(string, string) []KeyValue,
+	reducef func(string, []string) string) {
+
+	// Your worker implementation here.
+	for {
+		task := RequestTask()
+
+		switch task.Type {
+		case MAP:
+			MapTask(task, mapf)
+
+		case REDUCE:
+			ReduceTask(task, reducef)
+
+		case WAITING:
+			DPrintln("Waitng...")
+			time.Sleep(100 * time.Millisecond)
+
+		case QUIT:
+			os.Exit(0)
+		}
+
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+```
+最后便是一个worker的核心功能，进行Map或者Reduce任务。
+
+需要注意的是测试程序会选择直接终止Map任务或Reduce任务来模拟机器崩溃，这就意味着我们要防止某个文件写入到一半终止后，该不完整的文件被后续Reduce任务所读取，产生不必要的错误。
+因此我们采用课程官网提到的小技巧，将所有任务输出文件先写入到临时文件中，等该worker当前任务完成后（这里指所有文件写入完毕后），我们再将其修改为真正的中间文件名供Reducer读取。
+```go
+func MapTask(task *Task, mapf func(string, string) []KeyValue) {
+	// Open the input file.
+	filename := task.FileName
+
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", filename)
+	}
+	content, err := io.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", filename)
+	}
+	file.Close()
+
+	kva := mapf(filename, string(content))
+
+	// Map a key to its corresponding reducer, and write it to a bucket (partitioning).
+	buckets := make(map[int][]KeyValue)
+	nReduce := task.NReduce
+	for _, kv := range kva {
+		index := ihash(kv.Key) % nReduce
+		buckets[index] = append(buckets[index], kv)
+	}
+
+	// Prepare to keep track of temp files and their intended final names.
+	tempFiles := make(map[string]string)
+
+	// Write each bucket into a separate intermediate file.
+	for i := 0; i < nReduce; i++ {
+		// Create a temporary file
+		tempFile, err := os.CreateTemp(".", "temp_map_")
+		if err != nil {
+			log.Fatalf("Failed to create temporary file: %v", err)
+		}
+		tempFileName := tempFile.Name()
+		finalFileName := getIntermediateFileName(task.ID, i)
+		tempFiles[tempFileName] = finalFileName
+
+		// Write key/value pairs in JSON format to the temporary file
+		enc := json.NewEncoder(tempFile)
+		kvs := buckets[i]
+		for _, kv := range kvs {
+			if err := enc.Encode(&kv); err != nil {
+				log.Fatalf("Fail to encode kv: %v", err)
+			}
+		}
+		// Close the temporary file
+		tempFile.Close()
+	}
+
+	// Rename all temporary files to their final names
+	for tempFileName, finalFileName := range tempFiles {
+		if err := os.Rename(tempFileName, finalFileName); err != nil {
+			log.Fatalf("Failed to rename file from %s to %s: %v", tempFileName, finalFileName, err)
+		}
+	}
+
+	go sendTaskDone(task.ID, task.Type)
+}
+```
+对于Reduce任务也是一样，要防止任务中断导致输出文件不完整而被用户当作正常文件，因此我们也需要最后的文件重命名：
+```go
+func ReduceTask(task *Task, reducef func(string, []string) string) {
+	nMap := task.NMap
+	intermediate := make([]KeyValue, 0)
+	// Read corresponding key-value pairs from mappers' outputs.
+	for i := 0; i < nMap; i++ {
+		rFile, err := os.Open(getIntermediateFileName(i, task.ID))
+		if err != nil {
+			log.Println("Open intermediate file failed!")
+		}
+		// Decode the file.
+		dec := json.NewDecoder(rFile)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			intermediate = append(intermediate, kv)
+		}
+	}
+	// Sorting
+	sort.Sort(ByKey(intermediate))
+	tempFile, _ := os.CreateTemp(".", "temp_reduce_")
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		// This is the correct format for each line of Reduce output.
+		fmt.Fprintf(tempFile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+
+	tempFileName := tempFile.Name()
+	tempFile.Close()
+
+	for i := 0; i < nMap; i++ {
+		os.Remove(getIntermediateFileName(i, task.ID))
+	}
+
+	finalFileName := getOutputFileName(task.ID)
+	if err := os.Rename(tempFileName, finalFileName); err != nil {
+		log.Fatalf("Failed to rename file from %s to %s: %v", tempFileName, finalFileName, err)
+	}
+	DPrintln(task.ID, task.Type)
+	go sendTaskDone(task.ID, task.Type)
+}
+```
+对于输出文件的命名，采用了官网推荐的方式：
+* Map任务：mr-X-Y
+* Reduce任务：mr-out-Y
+```go
+func getIntermediateFileName(mapId int, reduceId int) string {
+	return fmt.Sprintf("mr-%d-%d", mapId, reduceId)
+}
+
+func getOutputFileName(reduceNumber int) string {
+	return fmt.Sprintf("mr-out-%d", reduceNumber)
+}
+```
+至于他们的前身临时文件，采用了"temp_map_X"和"temp_reduce_Y"的方式，可自行命名（能与正式文件区分即可）
 # LAB2: Raft
 Raft官网的可交互性动画对于理解论文中的细节非常有帮助https://raft.github.io
 Raft是分布式系统中理解起来相对容易的一致性算法/协议。一致性对于fault-tolerant systems非常重要，Raft通过几个重要的特性来实现一致性（论文Figure 3）：
