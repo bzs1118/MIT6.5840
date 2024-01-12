@@ -41,62 +41,48 @@ func Worker(mapf func(string, string) []KeyValue,
 	// Your worker implementation here.
 	for {
 
-		task, finished := RequestTask()
-
-		if finished == 1 {
-			os.Exit(0)
-		}
+		task := RequestTask()
 
 		switch task.Type {
 		case MAP:
-			DPrintln("Map task ", task.FileName)
-			// go func(t Task) {
-			// 	MapTask(&t, mapf)
-			// }(*task)
 			MapTask(task, mapf)
 
 		case REDUCE:
-			DPrintln("Reduce task")
-			// go func(t Task) {
-			// 	ReduceTask(&t, reducef)
-			// }(*task)
 			ReduceTask(task, reducef)
 
 		case WAITING:
 			DPrintln("Waitng...")
-			time.Sleep(time.Second)
+			time.Sleep(100 * time.Millisecond)
+
+		case QUIT:
+			os.Exit(0)
 		}
-		time.Sleep(100 * time.Millisecond)
+
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 
-func RequestTask() (*Task, int) {
+func RequestTask() *Task {
 	args := RequestTaskArgs{}
 	reply := RequestTaskReply{}
 
-	ok := call("Coordinator.RequestTask", &args, &reply)
-	if ok {
-		DPrintf("Obtain %s task %v.\n", reply.Task.Type, reply.Task.ID)
-	} else {
-		DPrintf("Fail to obtain a task!\n")
+	if ok := call("Coordinator.RequestTask", &args, &reply); !ok {
+		log.Println("RequestTask call failed!")
 	}
-	return reply.Task, reply.Finished
+	return reply.Task
 }
 
-func TaskDone(taskId int, taskType string) {
+func sendTaskDone(taskId int, taskType string) {
 	args := TaskDoneArgs{taskId, taskType}
 	reply := TaskDoneReply{}
-	DPrintln("TaskDonecall", taskId)
-	ok := call("Coordinator.TaskDone", &args, &reply)
-	if ok {
-		DPrintf("succeed to send Task %v done sign\n", taskId)
-	} else {
-		DPrintf("Fail to send Task %v done sign\n", taskId)
+
+	if ok := call("Coordinator.TaskDone", &args, &reply); !ok {
+		log.Println("sendTaskDone failed!")
 	}
 }
 
 func MapTask(task *Task, mapf func(string, string) []KeyValue) {
-	// Open the file related to current task.
+	// Open the input file.
 	filename := task.FileName
 
 	file, err := os.Open(filename)
@@ -111,34 +97,48 @@ func MapTask(task *Task, mapf func(string, string) []KeyValue) {
 
 	kva := mapf(filename, string(content))
 
-	// Map a key to its corresponding reducer,
-	// and write it to a bucket(partitioning).
-
+	// Map a key to its corresponding reducer, and write it to a bucket (partitioning).
 	buckets := make(map[int][]KeyValue)
 	nReduce := task.NReduce
 	for _, kv := range kva {
 		index := ihash(kv.Key) % nReduce
 		buckets[index] = append(buckets[index], kv)
 	}
+
+	// Prepare to keep track of temp files and their intended final names.
+	tempFiles := make(map[string]string)
+
 	// Write each bucket into a separate intermediate file.
 	for i := 0; i < nReduce; i++ {
-		rFile, err := os.Create(getTempFileName(task.ID, i))
+		// Create a temporary file
+		tempFile, err := os.CreateTemp(".", "temp_map_")
 		if err != nil {
-			log.Println("Intermediate File creation failed.")
+			log.Fatalf("Failed to create temporary file: %v", err)
 		}
-		defer rFile.Close()
+		tempFileName := tempFile.Name()
+		finalFileName := getIntermediateFileName(task.ID, i)
+		tempFiles[tempFileName] = finalFileName
 
-		// Write key/value pairs in JSON format to the open file。
-		enc := json.NewEncoder(rFile)
+		// Write key/value pairs in JSON format to the temporary file
+		enc := json.NewEncoder(tempFile)
 		kvs := buckets[i]
-
 		for _, kv := range kvs {
 			if err := enc.Encode(&kv); err != nil {
-				log.Println("Fail to encode kv! err:", err)
+				log.Fatalf("Fail to encode kv: %v", err)
 			}
 		}
+		// Close the temporary file
+		tempFile.Close()
 	}
-	TaskDone(task.ID, task.Type)
+
+	// Rename all temporary files to their final names
+	for tempFileName, finalFileName := range tempFiles {
+		if err := os.Rename(tempFileName, finalFileName); err != nil {
+			log.Fatalf("Failed to rename file from %s to %s: %v", tempFileName, finalFileName, err)
+		}
+	}
+
+	go sendTaskDone(task.ID, task.Type)
 }
 
 func ReduceTask(task *Task, reducef func(string, []string) string) {
@@ -146,7 +146,7 @@ func ReduceTask(task *Task, reducef func(string, []string) string) {
 	intermediate := make([]KeyValue, 0)
 	// Read corresponding key-value pairs from mappers' outputs.
 	for i := 0; i < nMap; i++ {
-		rFile, err := os.Open(getTempFileName(i, task.ID))
+		rFile, err := os.Open(getIntermediateFileName(i, task.ID))
 		if err != nil {
 			log.Println("Open intermediate file failed!")
 		}
@@ -162,7 +162,7 @@ func ReduceTask(task *Task, reducef func(string, []string) string) {
 	}
 	// Sorting
 	sort.Sort(ByKey(intermediate))
-	ofile, _ := os.Create(getOutputFileName(task.ID))
+	tempFile, _ := os.CreateTemp(".", "temp_reduce_")
 	i := 0
 	for i < len(intermediate) {
 		j := i + 1
@@ -176,20 +176,27 @@ func ReduceTask(task *Task, reducef func(string, []string) string) {
 		output := reducef(intermediate[i].Key, values)
 
 		// This is the correct format for each line of Reduce output.
-		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+		fmt.Fprintf(tempFile, "%v %v\n", intermediate[i].Key, output)
 
 		i = j
 	}
 
-	ofile.Close()
+	tempFileName := tempFile.Name()
+	tempFile.Close()
+
 	for i := 0; i < nMap; i++ {
-		os.Remove(getTempFileName(i, task.ID))
+		os.Remove(getIntermediateFileName(i, task.ID))
+	}
+
+	finalFileName := getOutputFileName(task.ID)
+	if err := os.Rename(tempFileName, finalFileName); err != nil {
+		log.Fatalf("Failed to rename file from %s to %s: %v", tempFileName, finalFileName, err)
 	}
 	DPrintln(task.ID, task.Type)
-	TaskDone(task.ID, task.Type)
+	go sendTaskDone(task.ID, task.Type)
 }
 
-func getTempFileName(mapId int, reduceId int) string {
+func getIntermediateFileName(mapId int, reduceId int) string {
 	return fmt.Sprintf("mr-%d-%d", mapId, reduceId)
 }
 

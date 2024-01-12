@@ -27,8 +27,7 @@ type RequestTaskArgs struct {
 }
 
 type RequestTaskReply struct {
-	Task     *Task
-	Finished int
+	Task *Task
 }
 
 type TaskDoneArgs struct {

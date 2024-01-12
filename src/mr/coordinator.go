@@ -37,13 +37,13 @@ const (
 
 type Coordinator struct {
 	// Your definitions here.
-	state       string
-	nReduce     int
-	nMap        int
-	taskQue     chan *Task
-	nTasks      int
-	onGoingTask map[int]*Task
-	mu          sync.Mutex
+	state         string
+	nReduce       int
+	nMap          int
+	taskQue       chan *Task
+	finishedTasks int
+	onGoingTask   map[int]*Task
+	mu            sync.Mutex
 }
 
 type Task struct {
@@ -101,10 +101,10 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.nReduce = nReduce
 	c.nMap = len(files)
 	c.taskQue = make(chan *Task, max(len(files), nReduce))
-	c.nTasks = 0
 	c.mu = sync.Mutex{}
 	c.state = MAP
 	c.onGoingTask = make(map[int]*Task)
+	c.finishedTasks = 0
 
 	for i, filename := range files {
 		// Create a map task.
@@ -117,48 +117,41 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			Deadline: -1,
 		}
 		c.taskQue <- &task
-		c.nTasks++
-
 	}
+
 	go c.detector()
 	go c.server()
 	return &c
 }
 
 func (c *Coordinator) detector() {
-	i := 0
 	for {
 		c.mu.Lock()
-		DPrintln("detector Setlock:", i)
-		if c.nTasks == 0 {
+		if c.state == MAP && c.finishedTasks == c.nMap ||
+			c.state == REDUCE && c.finishedTasks == c.nReduce ||
+			c.state == QUIT && c.finishedTasks == c.nReduce {
 			c.changeState()
 		} else {
 			c.taskTimeout()
 		}
 		c.mu.Unlock()
-		DPrintln("detector Releaselock:", i)
-		i++
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 
 func (c *Coordinator) taskTimeout() {
 	// Check if there are any timeouts in the currently running tasks,
 	// remove them from c.onGongingTask, and then re-add them to c.taskQue.
-	keysToDelete := []int{}
-	for key, task := range c.onGoingTask {
-		//DPrintln(time.Now().Unix(), " ", task.Deadline)
-
+	tasksToDelete := []int{}
+	for taskID, task := range c.onGoingTask {
 		if time.Now().Unix() > task.Deadline {
-			// Exceed the time limit.
-			DPrintln("TLM -->", task.ID)
 			task.Deadline = -1
 			c.taskQue <- task
-			keysToDelete = append(keysToDelete, key)
+			tasksToDelete = append(tasksToDelete, taskID)
 		}
 	}
 
-	for _, key := range keysToDelete {
+	for _, key := range tasksToDelete {
 		delete(c.onGoingTask, key)
 	}
 }
@@ -176,53 +169,39 @@ func (c *Coordinator) changeState() {
 				NMap:     c.nMap,
 				Deadline: -1,
 			}
-			c.nTasks++
 			c.taskQue <- &task
+			c.finishedTasks = 0
 		}
-		DPrintln("map =======> reduce")
 	} else if c.state == REDUCE {
+		DPrintln("QUIT!!!!")
 		c.state = QUIT
-		DPrintln("reduce =======> quit")
-		time.Sleep(time.Second)
-
 	} else {
+		DPrintln("FINISHED!!!!")
 		c.state = FINISHIED
-		DPrintln("Finished")
-		time.Sleep(time.Second)
 		os.Exit(0)
 	}
 }
 
 func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) error {
 	c.mu.Lock()
-	DPrintln("RequestTask set lock!")
-	if len(c.taskQue) != 0 && c.state != QUIT {
+	if len(c.taskQue) != 0 {
 		task := <-c.taskQue
 		task.Deadline = time.Now().Add(TIME_OUT).Unix()
 		reply.Task = task
-		DPrintln("Send task", task.ID)
-		reply.Finished = 0
 		c.onGoingTask[task.ID] = task
-
 	} else if len(c.taskQue) == 0 && c.state != QUIT {
 		reply.Task = &Task{Type: WAITING}
-		reply.Finished = 0
 	} else {
 		reply.Task = &Task{Type: QUIT}
-		reply.Finished = 1
 	}
 	c.mu.Unlock()
-	DPrintln("RequestTask release lock!")
 	return nil
 }
 
 func (c *Coordinator) TaskDone(args *TaskDoneArgs, reply *TaskDoneReply) error {
 	c.mu.Lock()
-	DPrintln("TaskDone set lock!")
-	c.nTasks--
 	delete(c.onGoingTask, args.ID)
-	log.Printf("%v Task %v Done", args.TYPE, args.ID)
+	c.finishedTasks++
 	c.mu.Unlock()
-	DPrintln("TaskDone release lock!")
 	return nil
 }
